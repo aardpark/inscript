@@ -1,0 +1,6 @@
+__pycache__/
+*.egg-info/
+dist/
+.pytest_cache/
+research/
+inscript_pkg/reflect.py

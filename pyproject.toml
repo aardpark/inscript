@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inscript"
+version = "0.8.0"
+description = "Universal agent activity ledger. Records what AI agents do."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+]
+authors = [
+    {name = "Andrew Park"},
+]
+keywords = ["ai", "agent", "context", "mcp", "claude", "session", "tracking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/aardpark/inscript"
+
+[project.scripts]
+inscript = "inscript_pkg:cli"
+inscript-hook = "inscript_pkg.hook:main"
+inscript-mcp = "inscript_pkg.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["inscript_pkg*"]
