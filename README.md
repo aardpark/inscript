@@ -78,7 +78,7 @@ Four Claude Code hooks write to `~/.inscript/`:
 
 - **SessionStart** — creates session, finalizes previous session, injects handoff context
 - **UserPromptSubmit** — records prompts with tags and branch IDs
-- **PostToolUse** — records file touches, diffs, and project context
+- **PostToolUse** — records file touches, diffs, project context, and git commits
 - **Stop** — writes running summary snapshot
 
 An MCP server (`inscript-mcp`) wraps the session data as callable tools. Agents see `replay`, `log`, `sessions`, and `status` in their tool list and can call them when they need context.

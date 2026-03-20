@@ -282,7 +282,7 @@ def _build_handoff_context(prev_session: str) -> str | None:
         lines.append(f"Main files: {files_str}")
     if detour_count:
         lines.append(f"{detour_count} detour(s) detected.")
-    lines.append("Run `inscript replay` or `inscript viz <N>` for full context.")
+    lines.append("Use inscript MCP tools (replay, log, message, file_history, commits) for full context. `inscript explore` opens the interactive TUI.")
 
     # Last few prompts with activity summary
     tail_count = min(5, len(prompts))
@@ -369,10 +369,19 @@ def handle_prompt_submit(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def handle_post_tool_use(data: dict) -> None:
-    """Record a file touch, update active project, record diffs."""
+    """Record a file touch, update active project, record diffs, detect git commits."""
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
     tool_response = data.get("tool_response", {})
+
+    # Git commit detection (Bash tool)
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        if _is_git_commit(command):
+            stdout = tool_response.get("stdout", "")
+            if tool_response.get("success", False) or tool_response.get("exit_code") == 0:
+                _handle_git_commit(data, command, stdout)
+        return  # Bash touches are not file touches
 
     # Extract file path
     file_path = _extract_path(data)
@@ -484,6 +493,139 @@ def handle_post_tool_use(data: dict) -> None:
     # Check for overlap with other active sessions
     if root:
         _check_overlap(session_id, str(root), display_path)
+
+
+# ---------------------------------------------------------------------------
+# Git commit detection
+# ---------------------------------------------------------------------------
+
+def _is_git_commit(command: str) -> bool:
+    """Check if a bash command is a git commit."""
+    # Match: git commit, git -C ... commit, etc.
+    # Exclude: git commit --amend (still a commit, still track it)
+    # Exclude: git log, git status, git diff, etc.
+    stripped = command.strip()
+    # Handle chained commands: look for git commit in any segment
+    for segment in re.split(r'[;&|]+', stripped):
+        segment = segment.strip()
+        if re.match(r'^git\b.*\bcommit\b', segment):
+            return True
+        # Handle: git -C /path commit ...
+        if re.match(r'^git\s+-C\s+\S+\s+commit\b', segment):
+            return True
+    return False
+
+
+def _parse_commit_hash(stdout: str) -> str | None:
+    """Extract commit hash from git commit output.
+
+    Git commit output looks like:
+      [main abc1234] commit message
+    or:
+      [main (root-commit) abc1234] commit message
+    """
+    match = re.search(r'\[[\w/.-]+\s+(?:\([\w-]+\)\s+)?([0-9a-f]{7,40})\]', stdout)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _parse_commit_message(stdout: str) -> str:
+    """Extract commit message from git commit output."""
+    match = re.search(r'\[[^\]]+\]\s+(.+?)(?:\n|$)', stdout)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _handle_git_commit(data: dict, command: str, stdout: str) -> None:
+    """Record a git commit and link it to the prompts that produced it."""
+    commit_hash = _parse_commit_hash(stdout)
+    if not commit_hash:
+        return
+
+    session_id = active_session()
+    if not session_id:
+        return
+
+    sdir = SESSIONS_DIR / session_id
+    prompt_idx = _current_prompt_idx(sdir)
+    commit_message = _parse_commit_message(stdout)
+
+    # Find the project (git root) from the cwd or active project
+    project = None
+    cwd = data.get("cwd", "")
+    if cwd:
+        root = _find_git_root(cwd)
+        if root:
+            project = str(root)
+    if not project:
+        try:
+            project = ACTIVE_PROJECT_FILE.read_text().strip()
+        except OSError:
+            pass
+
+    # Walk backwards through recent touches to find which prompts edited
+    # files that are likely in this commit
+    touches = []
+    touches_file = sdir / "touches.jsonl"
+    if touches_file.exists():
+        for line in touches_file.open():
+            try:
+                touches.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    # Find prompts that edited files (these are the prompts that contributed)
+    contributing_prompts: dict[int, set[str]] = {}  # prompt_idx -> set of files edited
+    for t in touches:
+        if t.get("action") in ("edit", "write"):
+            pidx = t.get("prompt_idx")
+            if pidx is not None:
+                contributing_prompts.setdefault(pidx, set()).add(t.get("file", ""))
+
+    # The commit prompt is the one that ran git commit
+    # Contributing prompts are all prompts that edited files before this commit
+    # (since the last commit, if we have that info)
+    last_commit_prompt = None
+    commits = []
+    commits_file = sdir / "commits.jsonl"
+    if commits_file.exists():
+        for line in commits_file.open():
+            try:
+                commits.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if commits:
+        last_commit_prompt = commits[-1].get("prompt_idx")
+
+    # Only include prompts after the last commit
+    relevant_prompts = sorted(
+        pidx for pidx in contributing_prompts
+        if last_commit_prompt is None or pidx > last_commit_prompt
+    )
+
+    # Collect the files those prompts edited
+    committed_files = set()
+    for pidx in relevant_prompts:
+        committed_files.update(contributing_prompts[pidx])
+
+    entry = {
+        "ts": _now_time(),
+        "hash": commit_hash,
+        "message": commit_message,
+        "prompt_idx": prompt_idx,
+        "contributing_prompts": relevant_prompts,
+        "files": sorted(committed_files),
+    }
+    if project:
+        entry["project"] = project
+
+    tag = _current_tag(sdir)
+    if tag:
+        entry["tag"] = tag
+
+    _append_jsonl(sdir / "commits.jsonl", entry)
 
 
 def _check_overlap(current_session: str, project: str, file_path: str) -> None:
