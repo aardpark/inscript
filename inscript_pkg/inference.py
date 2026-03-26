@@ -1,15 +1,6 @@
 """Branch inference and decision point detection — purely behavioral."""
 from __future__ import annotations
 
-from pathlib import Path
-
-
-def _is_bookkeeping(f: str) -> bool:
-    """Paths that are operational overhead, not real work focus."""
-    home = str(Path.home())
-    return f.startswith(f"{home}/.claude/") or f.startswith(f"{home}/.inscript/")
-
-
 def _touch_focus(touches: list[dict]) -> set[str]:
     """Extract focus set (project roots or parent dirs) from touches."""
     focus = set()

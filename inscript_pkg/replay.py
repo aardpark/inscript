@@ -281,6 +281,7 @@ def generate_replay(session_id: str) -> str | None:
     notes = _load_jsonl(sdir / "notes.jsonl")
     if notes:
         lines.append("### Notes")
+        short_id = session_id[:8]
         for n in notes:
             text = n.get("text", "")
             ref = n.get("ref")
@@ -289,8 +290,35 @@ def generate_replay(session_id: str) -> str | None:
             line = f"- {text}{prompt_ref}"
             if ref:
                 line += f" -> {_rel_path(ref, project)}"
+            if n.get("has_response") and pidx is not None:
+                line += f" [expand: {short_id}:{pidx + 1}]"
             lines.append(line)
         lines.append("")
+
+    # Cross-session notes from other sessions on same project
+    if project:
+        try:
+            cross_notes = []
+            for s in list_sessions():
+                sid = s.get("session_id", "")
+                if sid == session_id:
+                    continue
+                if s.get("project") != project:
+                    continue
+                s_notes = _load_jsonl(session_dir(sid) / "notes.jsonl")
+                for n in s_notes[-5:]:
+                    cross_notes.append((sid[:8], s.get("start_time", "")[:10], n))
+            if cross_notes:
+                lines.append("### Notes from other sessions")
+                for sid_short, date, n in cross_notes[-10:]:
+                    text = n.get("text", "")
+                    if len(text) > 120:
+                        text = text[:117] + "..."
+                    line = f"- [{sid_short} {date}] {text}"
+                    lines.append(line)
+                lines.append("")
+        except Exception:
+            pass
 
     tokens = summary.get("tokens")
     if tokens:

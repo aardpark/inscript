@@ -10,8 +10,6 @@ from . import (
     list_sessions,
     session_dir,
 )
-from .commands import _format_secs
-from .inference import infer_branches
 from .replay import _format_duration
 from .viz import (
     _diff_summary,

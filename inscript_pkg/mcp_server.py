@@ -21,6 +21,7 @@ from . import (
     session_dir,
 )
 from .replay import generate_log, generate_replay, generate_file_history
+from .viz import _load_transcript_responses
 
 mcp = FastMCP("inscript")
 
@@ -28,7 +29,9 @@ mcp = FastMCP("inscript")
 def _resolve_session(session_id: str | None, skip_current: bool = False) -> str | None:
     """Resolve a session ID, defaulting to the most recent completed session."""
     if session_id:
-        return session_id
+        # Try prefix resolution (e.g. "8b08c408" -> full UUID)
+        resolved = _resolve_session_by_prefix(session_id)
+        return resolved or session_id
 
     current = active_session()
     sessions = list_sessions()
@@ -140,7 +143,7 @@ def message(ref: str) -> str:
     """Look up a specific message by reference. Accepts 'session_id:prompt_idx'
     (e.g. '1bf733d6:5') or just a prompt index for the current session (e.g. '5').
 
-    Returns the prompt text, all file touches with actions, and diffs for that message.
+    Returns the prompt text, assistant response, file touches, and diffs.
     """
     if ":" in ref:
         sid_part, idx_part = ref.split(":", 1)
@@ -169,10 +172,13 @@ def message(ref: str) -> str:
     p = prompts[prompt_idx]
 
     project = None
+    transcript_path = None
     meta_file = sdir / "meta.json"
     if meta_file.exists():
         try:
-            project = json.loads(meta_file.read_text()).get("project")
+            meta = json.loads(meta_file.read_text())
+            project = meta.get("project")
+            transcript_path = meta.get("transcript_path")
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -184,6 +190,24 @@ def message(ref: str) -> str:
     lines.append("")
     lines.append(f"> {p.get('prompt', '')}")
     lines.append("")
+
+    # Load assistant response from transcript
+    responses = {}
+    if transcript_path:
+        responses = _load_transcript_responses(transcript_path, prompts)
+    parts = responses.get(prompt_idx, [])
+    if parts:
+        lines.append("Response:")
+        for kind, content in parts:
+            if kind == "text":
+                if len(content) > 2000:
+                    lines.append(content[:2000])
+                    lines.append(f"... ({len(content) - 2000} chars truncated)")
+                else:
+                    lines.append(content)
+            elif kind == "tool":
+                lines.append(f"  [{content}]")
+        lines.append("")
 
     touches = _load_jsonl(sdir / "touches.jsonl")
     prompt_touches = [t for t in touches if t.get("prompt_idx") == prompt_idx]
@@ -223,8 +247,162 @@ def message(ref: str) -> str:
                         lines.append(f"    ... ({len(content_lines) - 10} more lines)")
             lines.append("")
 
-    if not prompt_touches and not prompt_diffs:
+    if not prompt_touches and not prompt_diffs and not (transcript_path and responses.get(prompt_idx)):
         lines.append("(no file activity for this prompt)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def thread(hours: float = 0.5, messages_per_session: int = 5) -> str:
+    """Show recent activity across all sessions, grouped by session, ordered by time.
+
+    Shows the last N hours of work across all active and recent sessions.
+    Each session's messages are grouped together (not interleaved),
+    but sessions are ordered by when they were most recently active.
+
+    This is how you catch up on what's been happening across parallel work.
+
+    Args:
+        hours: How far back to look (default 2 hours).
+        messages_per_session: Max messages to show per session (default 10, from tail).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    all_sessions = list_sessions()
+    if not all_sessions:
+        return "No sessions found."
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    # Collect session data with timestamps
+    session_data: list[dict] = []
+
+    for s in all_sessions:
+        sid = s["session_id"]
+        sdir = session_dir(sid)
+        prompts = _load_prompts(sdir)
+        if not prompts:
+            continue
+
+        # Filter to prompts within the time window
+        recent = []
+        for p in prompts:
+            ts = p.get("ts", "")
+            if not ts:
+                continue
+            try:
+                # Parse timestamp — try common formats
+                for fmt in ("%H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+                    try:
+                        pt = datetime.strptime(ts, fmt)
+                        if fmt == "%H:%M:%S":
+                            # Time-only: assume today, attach date from session start
+                            start = s.get("start_time", "")
+                            if start:
+                                date_part = start[:10]
+                                pt = datetime.strptime(f"{date_part}T{ts}", "%Y-%m-%dT%H:%M:%S")
+                            pt = pt.replace(tzinfo=timezone.utc)
+                        elif pt.tzinfo is None:
+                            pt = pt.replace(tzinfo=timezone.utc)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    continue
+
+                if pt >= cutoff:
+                    recent.append(p)
+            except Exception:
+                continue
+
+        if not recent:
+            continue
+
+        # Load metadata
+        project = None
+        transcript_path = None
+        meta_file = sdir / "meta.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                project = meta.get("project")
+                transcript_path = meta.get("transcript_path")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Load responses
+        responses = {}
+        if transcript_path:
+            responses = _load_transcript_responses(transcript_path, prompts)
+
+        # Tail the recent messages
+        tail = recent[-messages_per_session:]
+
+        # Latest timestamp for sorting sessions
+        latest_ts = tail[-1].get("ts", "")
+
+        session_data.append({
+            "session_id": sid,
+            "project": project,
+            "status": s.get("status", "?"),
+            "start_time": s.get("start_time", "?"),
+            "latest_ts": latest_ts,
+            "prompts": tail,
+            "responses": responses,
+            "total_prompts": len(prompts),
+            "total_recent": len(recent),
+        })
+
+    if not session_data:
+        return f"No messages in the last {hours}h."
+
+    # Sort sessions by latest activity (most recent last)
+    session_data.sort(key=lambda x: x["latest_ts"])
+
+    # Format
+    total_msgs = sum(len(sd["prompts"]) for sd in session_data)
+    lines = [f"Last {hours}h: {total_msgs} messages across {len(session_data)} session(s)\n"]
+
+    for sd in session_data:
+        sid = sd["session_id"]
+        project_name = sd["project"].rstrip("/").split("/")[-1] if sd["project"] else "?"
+        status = sd["status"]
+        shown = len(sd["prompts"])
+        total = sd["total_recent"]
+        skipped = total - shown
+
+        header = f"--- {sid[:8]} ({project_name})"
+        if status == "active":
+            header += " *active*"
+        header += " ---"
+        lines.append(header)
+
+        if skipped > 0:
+            lines.append(f"  ({skipped} earlier messages not shown)")
+
+        for p in sd["prompts"]:
+            idx = p.get("idx", 0)
+            ts = p.get("ts", "")
+            prompt = p.get("prompt", "")
+            if len(prompt) > 120:
+                prompt = prompt[:117] + "..."
+
+            lines.append(f"  [{ts}] {idx + 1}. > {prompt}")
+
+            # Show first text response, truncated
+            parts = sd["responses"].get(idx, [])
+            for kind, content in parts:
+                if kind == "text":
+                    text = content.strip()
+                    if len(text) > 300:
+                        lines.append(f"       {text[:300]}...")
+                    else:
+                        lines.append(f"       {text}")
+                    break
+
+        lines.append(f"  (expand: message \"{sid[:8]}:<number>\")")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -348,50 +526,17 @@ def notes(session_id: str | None = None) -> str:
     return f.getvalue().strip() or f"No notes in session {sid[:8]}."
 
 
-@mcp.tool()
-def categories(session_id: str | None = None) -> str:
-    """Analyze prompt categories for a session — the structural shape of each prompt.
-
-    Each prompt is classified by its tool-use pattern (not content):
-    idle, investigate, search, read-edit, deep-edit, explore-edit,
-    direct, direct-multi, iteration, create, study-create.
-
-    Shows the category sequence, work density, and dominant transitions.
-    Pass 'all' to see recurring workflow patterns across sessions.
-    """
-    from .categories import format_session_categories, format_workflow_patterns
-
-    if session_id == "all":
-        return format_workflow_patterns()
-
-    sid = _resolve_session(session_id)
-    if not sid:
-        return "No sessions found."
-    return format_session_categories(sid)
-
-
-@mcp.tool()
-def concepts(file_name: str | None = None) -> str:
-    """Detect cross-session concepts — recurring clusters of files worked on together.
-
-    Concepts emerge from behavioral co-occurrence: files that repeatedly appear
-    in the same prompts across multiple sessions form a concept.
-
-    Without arguments, lists all detected concepts.
-    With a file_name, shows the cross-session history for that file's concept.
-    """
-    from .concepts import detect_concepts, format_concepts, concept_for_file, concept_history
-    from . import active_project
-
-    detected = detect_concepts()
-    if file_name:
-        c = concept_for_file(file_name, detected)
-        if c:
-            return concept_history(c)
-        return f"No concept found for '{file_name}'."
-
-    proj = active_project()
-    return format_concepts(detected, str(proj) if proj else None)
+# ---------------------------------------------------------------------------
+# Archived tools — kept as code for future use, not exposed as MCP tools.
+#
+# categories: classifies prompts by tool-use pattern (idle, investigate,
+#   create, etc.). Useful for studying workflow patterns but not actionable
+#   for agents. Available via CLI: inscript categories <session_id>
+#
+# concepts: cross-session file clustering by behavioral co-occurrence.
+#   Needs more session data to produce meaningful clusters. Revisit when
+#   users have 50+ sessions. Available via CLI: inscript concepts
+# ---------------------------------------------------------------------------
 
 
 def main():

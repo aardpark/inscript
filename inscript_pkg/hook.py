@@ -26,12 +26,14 @@ from pathlib import Path
 from . import (
     INSCRIPT_DIR,
     ACTIVE_PROJECT_FILE,
-    ACTIVE_SESSION_FILE,
     SESSIONS_DIR,
     OVERLAP_DIR,
-    active_session,
+    _append_jsonl,
+    active_session_for_hook,
+    set_active_session_for_hook,
     active_sessions,
     project_hash,
+    session_dir,
     store_diffs,
 )
 
@@ -49,12 +51,17 @@ def _extract_path(data: dict) -> str | None:
     inp = data.get("tool_input", {})
 
     path = inp.get("file_path") or inp.get("path")
-    if path and path.startswith("/"):
+    if path and Path(path).is_absolute():
         return path
 
     command = inp.get("command", "")
     if command:
+        # Unix absolute paths
         matches = re.findall(r"(/[^\s;|&\"']+)", command)
+        if matches:
+            return matches[0]
+        # Windows absolute paths (C:\...)
+        matches = re.findall(r"([A-Za-z]:\\[^\s;|&\"']+)", command)
         if matches:
             return matches[0]
 
@@ -83,12 +90,6 @@ def _tool_action(tool_name: str) -> str:
         "Grep": "grep",
     }.get(tool_name, "touch")
 
-
-def _append_jsonl(path: Path, data: dict) -> None:
-    """Append a JSON line to a file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(data, default=str) + "\n")
 
 
 def _count_lines(path: Path) -> int:
@@ -142,8 +143,8 @@ def handle_session_start(data: dict) -> dict | None:
     Returns a dict with hookSpecificOutput if there's a replay to inject,
     or None if no context to inject.
     """
-    # Finalize previous session and capture its ID for replay
-    prev_session = active_session()
+    # Finalize previous session for THIS Claude Code instance (per-PPID)
+    prev_session = active_session_for_hook()
     if prev_session:
         _finalize_session(prev_session)
 
@@ -172,9 +173,8 @@ def handle_session_start(data: dict) -> dict | None:
 
     (sdir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    # Mark as active session
-    INSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    ACTIVE_SESSION_FILE.write_text(session_id + "\n")
+    # Mark as active session (per-PPID + global)
+    set_active_session_for_hook(session_id)
 
     # Generate compact handoff context for the new session
     if prev_session:
@@ -320,6 +320,37 @@ def _build_handoff_context(prev_session: str) -> str | None:
     elif not last_touches:
         lines.append("     ^ no file activity -- may be unfinished")
 
+    # Cross-session notes: include recent notes from all sessions on the same project
+    project = meta.get("project")
+    if project:
+        try:
+            from . import list_sessions, _load_jsonl
+            cross_notes = []
+            for s in list_sessions():
+                sid = s.get("session_id", "")
+                if sid == prev_session:
+                    continue
+                if s.get("project") != project:
+                    continue
+                s_notes = _load_jsonl(SESSIONS_DIR / sid / "notes.jsonl")
+                for n in s_notes[-5:]:  # Last 5 notes per session
+                    cross_notes.append((sid[:8], s.get("start_time", "")[:10], n))
+
+            if cross_notes:
+                lines.append("")
+                lines.append(f"Notes from other sessions on this project ({len(cross_notes)}):")
+                for sid_short, date, n in cross_notes[-10:]:  # Cap at 10 total
+                    text = n.get("text", "")
+                    if len(text) > 100:
+                        text = text[:97] + "..."
+                    ref = n.get("ref")
+                    line = f"  [{sid_short} {date}] {text}"
+                    if ref:
+                        line += f" -> {ref.split('/')[-1]}"
+                    lines.append(line)
+        except Exception:
+            pass  # Don't block handoff if cross-notes fail
+
     return "\n".join(lines)
 
 
@@ -329,7 +360,7 @@ def _build_handoff_context(prev_session: str) -> str | None:
 
 def handle_prompt_submit(data: dict) -> None:
     """Record a user prompt, starting a new work block."""
-    session_id = active_session()
+    session_id = active_session_for_hook()
     if not session_id:
         session_id = f"s-{int(time.time())}"
         handle_session_start({"session_id": session_id})
@@ -362,6 +393,24 @@ def handle_prompt_submit(data: dict) -> None:
         entry["branch_id"] = branch_id
 
     _append_jsonl(sdir / "prompts.jsonl", entry)
+
+    # Auto-capture /btw messages as notes
+    # The agent's response is in the transcript at this prompt index —
+    # future sessions can use message tool to expand: "session:prompt_idx"
+    stripped = prompt.strip()
+    if stripped.lower().startswith("/btw ") or stripped.lower().startswith("/btw\n"):
+        note_text = stripped[4:].strip()
+        if note_text:
+            note_entry = {
+                "ts": _now_time(),
+                "text": note_text,
+                "prompt_idx": prompt_idx,
+                "source": "btw",
+                "has_response": True,  # expand with message tool for agent's reply
+            }
+            if tag:
+                note_entry["tag"] = tag
+            _append_jsonl(sdir / "notes.jsonl", note_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +450,7 @@ def handle_post_tool_use(data: dict) -> None:
             ACTIVE_PROJECT_FILE.write_text(str(root) + "\n")
 
     # Get or create session
-    session_id = active_session()
+    session_id = active_session_for_hook()
     if not session_id:
         # No session yet — create one implicitly
         session_id = f"s-{int(time.time())}"
@@ -492,7 +541,7 @@ def handle_post_tool_use(data: dict) -> None:
 
     # Check for overlap with other active sessions
     if root:
-        _check_overlap(session_id, str(root), display_path)
+        _check_overlap(session_id, str(root), display_path, action=action)
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +593,7 @@ def _handle_git_commit(data: dict, command: str, stdout: str) -> None:
     if not commit_hash:
         return
 
-    session_id = active_session()
+    session_id = active_session_for_hook()
     if not session_id:
         return
 
@@ -628,8 +677,13 @@ def _handle_git_commit(data: dict, command: str, stdout: str) -> None:
     _append_jsonl(sdir / "commits.jsonl", entry)
 
 
-def _check_overlap(current_session: str, project: str, file_path: str) -> None:
-    """Check if other active sessions are touching the same project."""
+def _check_overlap(current_session: str, project: str, file_path: str,
+                    action: str = "touch") -> None:
+    """Check if other active sessions are touching the same project.
+
+    Detects write-write conflicts: when this session edits/writes a file
+    that another active session has also edited/written.
+    """
     others = active_sessions()
     overlapping = [
         s["session_id"] for s in others
@@ -639,14 +693,42 @@ def _check_overlap(current_session: str, project: str, file_path: str) -> None:
     if not overlapping:
         return
 
+    # Check for write-write conflict: did another session also EDIT this file?
+    conflict = False
+    conflict_sessions = []
+    if action in ("edit", "write"):
+        for other_sid in overlapping:
+            other_sdir = session_dir(other_sid)
+            other_touches = other_sdir / "touches.jsonl"
+            if not other_touches.exists():
+                continue
+            try:
+                for line in other_touches.open():
+                    try:
+                        t = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (t.get("file") == file_path
+                            and t.get("action") in ("edit", "write")):
+                        conflict = True
+                        conflict_sessions.append(other_sid)
+                        break
+            except OSError:
+                pass
+
     OVERLAP_DIR.mkdir(parents=True, exist_ok=True)
     ph = project_hash(project)
-    _append_jsonl(OVERLAP_DIR / f"{ph}.jsonl", {
+    entry = {
         "ts": _now_time(),
         "file": file_path,
+        "action": action,
         "project": project,
         "sessions": [current_session] + overlapping,
-    })
+    }
+    if conflict:
+        entry["conflict"] = True
+        entry["conflict_sessions"] = [current_session] + conflict_sessions
+    _append_jsonl(OVERLAP_DIR / f"{ph}.jsonl", entry)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +777,7 @@ def _compute_token_usage(transcript_path: str) -> dict | None:
             "cache_write_tokens": total_cache_write,
             "total_tokens": total_input + total_output,
         }
-    except (OSError, Exception):
+    except Exception:
         return None
 
 
@@ -774,7 +856,7 @@ def handle_stop(data: dict) -> None:
     """Update running summary snapshot. Does NOT finalize the session —
     Claude Code fires Stop at the end of every turn, not just session end.
     Session finalization happens when a new SessionStart arrives."""
-    session_id = active_session()
+    session_id = active_session_for_hook()
     if not session_id:
         return
 
@@ -820,17 +902,20 @@ def main() -> None:
     # Claude Code sends "hook_event_name"; also accept "hook_event" for manual testing
     hook_event = data.get("hook_event_name") or data.get("hook_event", "")
 
-    if hook_event == "SessionStart":
-        result = handle_session_start(data)
-        if result:
-            print(json.dumps(result))
-    elif hook_event == "UserPromptSubmit":
-        handle_prompt_submit(data)
-    elif hook_event == "Stop":
-        handle_stop(data)
-    else:
-        # Default: PostToolUse (also handles backwards compat)
-        handle_post_tool_use(data)
+    try:
+        if hook_event == "SessionStart":
+            result = handle_session_start(data)
+            if result:
+                print(json.dumps(result))
+        elif hook_event == "UserPromptSubmit":
+            handle_prompt_submit(data)
+        elif hook_event == "Stop":
+            handle_stop(data)
+        else:
+            # Default: PostToolUse (also handles backwards compat)
+            handle_post_tool_use(data)
+    except Exception:
+        pass  # Hook must never crash — Claude Code waits for sync hooks
 
 
 if __name__ == "__main__":

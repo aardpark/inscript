@@ -9,19 +9,14 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from pathlib import Path
 
 from . import (
-    INSCRIPT_DIR,
     _load_jsonl,
     _load_prompts,
     _rel_path,
     list_sessions,
     session_dir,
 )
-
-
-CONCEPTS_FILE = INSCRIPT_DIR / "concepts.json"
 
 # Paths containing these fragments are infrastructure, not work concepts
 _INFRA_FRAGMENTS = {"/.claude/", "/.inscript/", "__pycache__", ".egg-info"}

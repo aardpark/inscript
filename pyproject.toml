@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inscript"
-version = "0.8.0"
+version = "0.9.1"
 description = "Universal agent activity ledger. Records what AI agents do."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 authors = [
     {name = "Andrew Park"},
@@ -25,6 +26,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]
+
+[project.optional-dependencies]
+reflect = ["anthropic>=0.40.0"]
 
 [project.urls]
 Homepage = "https://github.com/aardpark/inscript"

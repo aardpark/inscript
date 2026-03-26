@@ -349,12 +349,11 @@ def viz_overview(ctx: dict):
     duration_str = ""
     if summary.get("duration_seconds"):
         duration_str = f" ({_format_duration(summary['duration_seconds'])})"
+    from . import _format_tokens
     tokens_str = ""
     tok = summary.get("tokens")
     if tok:
         tokens_str = f" | {_format_tokens(tok.get('total_tokens', 0))} tokens"
-
-    from . import _format_tokens
 
     print(f"{sid_short}{duration_str}")
     print(f"{len(file_order)} files, {total_edits} edits, {len(prompts)} prompts{tokens_str}")

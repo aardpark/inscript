@@ -7,10 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    INSCRIPT_DIR,
-    CONFIG_FILE,
     OVERLAP_DIR,
     SESSIONS_DIR,
+    _append_jsonl,
     _format_tokens,
     _load_config,
     _load_jsonl,
@@ -20,13 +19,6 @@ from . import (
     session_dir,
 )
 from .replay import _format_duration
-
-
-def _append_jsonl(path: Path, data: dict) -> None:
-    """Append a JSON line to a file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(data, default=str) + "\n")
 
 
 def _ts_to_secs(ts: str) -> int:
@@ -529,11 +521,43 @@ def cmd_overlap():
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
-        if entries:
-            print(f"Project: {entries[0].get('project', f.stem)}")
-            for e in entries[-10:]:
-                print(f"  {e.get('ts', '?')}  {e.get('file', '?')}  sessions: {e.get('sessions', [])}")
+        if not entries:
+            continue
+
+        project = entries[0].get("project", f.stem)
+        conflicts = [e for e in entries if e.get("conflict")]
+        touches = [e for e in entries if not e.get("conflict")]
+
+        print(f"Project: {project}")
+
+        if conflicts:
+            # Group conflicts by file
+            conflict_files: dict[str, list[dict]] = {}
+            for c in conflicts:
+                conflict_files.setdefault(c.get("file", "?"), []).append(c)
+            print(f"  CONFLICTS ({len(conflicts)} writes to shared files):")
+            for fpath, events in sorted(conflict_files.items()):
+                sessions = set()
+                for e in events:
+                    for s in e.get("conflict_sessions", []):
+                        sessions.add(s[:8])
+                times = [e.get("ts", "") for e in events]
+                print(f"    {fpath}")
+                print(f"      sessions: {', '.join(sorted(sessions))}")
+                print(f"      times: {', '.join(times[-5:])}")
             print()
+
+        if touches:
+            # Deduplicate recent overlaps by file
+            recent: dict[str, dict] = {}
+            for e in touches[-50:]:
+                recent[e.get("file", "?")] = e
+            print(f"  Overlaps ({len(recent)} files touched while concurrent):")
+            for fpath, e in sorted(recent.items()):
+                action = e.get("action", "touch")
+                sids = [s[:8] for s in e.get("sessions", [])]
+                print(f"    {action:<5} {fpath}  [{', '.join(sids)}]")
+        print()
 
 
 def cmd_cleanup():
@@ -562,89 +586,7 @@ def cmd_cleanup():
     print(f"Removed {removed} sessions older than {days} days")
 
 
-def cmd_export(session_id: str):
-    sdir = session_dir(session_id)
-    meta_file = sdir / "meta.json"
-    if not meta_file.exists():
-        print(f"Session {session_id} not found", file=__import__("sys").stderr)
-        __import__("sys").exit(1)
-    meta = json.loads(meta_file.read_text())
-    summary_file = sdir / "summary.json"
-    touches_file = sdir / "touches.jsonl"
-    diffs_file = sdir / "diffs.jsonl"
-    print(f"# Session {session_id}\n")
-    print(f"- **Project**: {meta.get('project', '?')}")
-    print(f"- **Started**: {meta.get('start_time', '?')}")
-    if summary_file.exists():
-        s = json.loads(summary_file.read_text())
-        print(f"- **Ended**: {s.get('end_time', '?')}")
-        if s.get("duration_seconds"):
-            print(f"- **Duration**: {_format_duration(s['duration_seconds'])}")
-        print(f"- **Prompts**: {s.get('prompts', '?')}")
-        print(f"- **Files read**: {s.get('files_read', '?')}")
-        print(f"- **Files written**: {s.get('files_written', '?')}")
-        print(f"- **Total edits**: {s.get('total_edits', '?')}")
-        tokens = s.get("tokens")
-        if tokens:
-            print(f"- **Model**: {tokens.get('model', '?')}")
-            print(f"- **Tokens**: {_format_tokens(tokens.get('total_tokens', 0))} total ({_format_tokens(tokens.get('input_tokens', 0))} in, {_format_tokens(tokens.get('output_tokens', 0))} out)")
-            if tokens.get("cache_read_tokens"):
-                print(f"- **Cache**: {_format_tokens(tokens['cache_read_tokens'])} read, {_format_tokens(tokens.get('cache_write_tokens', 0))} written")
-    prompts = _load_prompts(sdir)
-    touches_by_prompt: dict[int | None, list[dict]] = {}
-    if touches_file.exists():
-        for line in touches_file.open():
-            try:
-                e = json.loads(line)
-                touches_by_prompt.setdefault(e.get("prompt_idx"), []).append(e)
-            except json.JSONDecodeError:
-                pass
-    diffs_by_prompt: dict[int | None, list[dict]] = {}
-    if diffs_file.exists():
-        for line in diffs_file.open():
-            try:
-                d = json.loads(line)
-                diffs_by_prompt.setdefault(d.get("prompt_idx"), []).append(d)
-            except json.JSONDecodeError:
-                pass
-    if prompts:
-        for p in prompts:
-            idx = p.get("idx", 0)
-            print(f"\n## \"{p.get('prompt', '?')}\"\n")
-            print(f"*{p.get('ts', '')}*\n")
-            touches = touches_by_prompt.get(idx, [])
-            if touches:
-                print("| Action | File | Details |")
-                print("|--------|------|---------|")
-                for t in touches:
-                    details = ""
-                    if t.get("lines_changed"):
-                        details = f"{t['lines_changed']} lines"
-                    elif t.get("lines"):
-                        details = f"{t['lines']} lines"
-                    print(f"| {t.get('action', '')} | `{t.get('file', '')}` | {details} |")
-                print()
-            diffs = diffs_by_prompt.get(idx, [])
-            for d in diffs:
-                if d.get("old_string") is not None:
-                    print(f"**`{d.get('file', '?')}`**")
-                    print(f"```diff\n- {d['old_string']}\n+ {d.get('new_string', '')}\n```\n")
-                elif d.get("is_new"):
-                    print(f"**`{d.get('file', '?')}`** — new file ({d.get('lines', '?')} lines)\n")
-    else:
-        if touches_by_prompt:
-            print(f"\n## Activity\n")
-            print("| Time | Action | File |")
-            print("|------|--------|------|")
-            for touches in touches_by_prompt.values():
-                for e in touches:
-                    print(f"| {e.get('ts', '')} | {e.get('action', '')} | `{e.get('file', '')}` |")
-        if diffs_by_prompt:
-            print(f"\n## Changes\n")
-            for diffs in diffs_by_prompt.values():
-                for d in diffs:
-                    if d.get("old_string") is not None:
-                        print(f"### `{d.get('file', '?')}` ({d.get('ts', '')})\n")
-                        print(f"```diff\n- {d['old_string']}\n+ {d.get('new_string', '')}\n```\n")
-                    elif d.get("is_new"):
-                        print(f"New file `{d.get('file', '?')}` ({d.get('lines', '?')} lines)\n")
+# Export and permissions commands moved to export.py and permissions.py
+# Re-export for backward compatibility with CLI dispatch
+from .export import cmd_export, cmd_chat_export  # noqa: F401
+from .permissions import cmd_permissions  # noqa: F401
