@@ -1,6 +1,6 @@
 # inscript
 
-Universal agent activity ledger. Records what AI agents do — which files they touch, what they change, how they spend their time — so you never lose context between sessions.
+Session memory for AI coding agents. Records what happens across Claude Code sessions so you never lose context.
 
 ## Install
 
@@ -9,105 +9,119 @@ pip install inscript
 inscript setup
 ```
 
-`inscript setup` does three things:
-1. Configures Claude Code hooks (passive recording)
-2. Registers the inscript MCP server (agent-facing tools)
-3. Creates default retention config
-
-No manual JSON editing required.
+That's it. `inscript setup` configures Claude Code hooks (passive recording), registers the MCP server (agent tools), and creates a default config. No manual JSON editing.
 
 ## What it does
 
-Inscript has two layers:
+**Passive recording** — Hooks silently capture every prompt, file touch, edit, and diff. When a new session starts, inscript compresses the previous session into a handoff summary that the new agent receives automatically. The agent doesn't know inscript exists — it just starts with context.
 
-**Passive recording** — Hooks silently capture every file read, edit, write, and prompt. When a session ends and a new one starts, inscript compresses the previous session into a compact handoff summary that the new session receives automatically.
-
-**Agent tools** — An MCP server exposes four tools that agents can call directly:
+**Agent tools** — An MCP server gives agents 10 tools they can call on demand:
 
 | Tool | What it does |
 |------|-------------|
-| `replay` | Compact context summary of a previous session — files, prompts, detours, where work left off |
-| `log` | Activity log with every prompt, file touched, and token usage |
-| `sessions` | List all recorded sessions with IDs and timestamps |
 | `status` | Current project, active session, other running sessions |
+| `sessions` | List all recorded sessions with IDs and timestamps |
+| `log` | Activity log — every prompt with files touched and token usage |
+| `replay` | Compact context summary of a previous session |
+| `message` | Drill into a specific prompt — full response text, file touches, diffs |
+| `thread` | Cross-session timeline — last 30min of work across all parallel sessions |
+| `file_history` | Complete diff arc for one file across a session |
+| `commits` | Git commits linked to the prompts that produced them |
+| `note` | Save a note to the session (surfaces in future replays) |
+| `notes` | List all notes for a session |
 
-Agents discover these tools automatically through MCP. No CLAUDE.md instructions needed.
+Agents discover these automatically through MCP. No CLAUDE.md instructions needed.
+
+## The session continuity problem
+
+Every new Claude Code session starts blind. You re-explain context, re-describe decisions, re-establish what was tried and rejected. Inscript fixes this:
+
+1. **Automatic handoff** — new sessions receive a summary of the previous session's work
+2. **Cross-session awareness** — `thread` shows what all parallel sessions are doing
+3. **Full history** — `message` retrieves any prompt + response from any session
+4. **Notes persist** — decisions and ideas survive session boundaries
 
 ## For humans
 
-### Interactive explorer
-
 ```bash
-inscript explore          # current session
-inscript explore <id>     # specific session
+inscript explore [id]     # interactive TUI — arrow keys to browse prompts
+inscript viz [id]         # visual heatmap — files x prompts
 ```
-
-Terminal UI for browsing sessions. Arrow keys to scrub through prompts, tabs for chat/diffs/files views.
-
-### Session visualization
-
-```bash
-inscript viz              # heatmap: files x prompts
-```
-
-Visual map of where an agent spent its time across files and prompts.
 
 ## CLI reference
 
 ```bash
+# Setup
 inscript setup            # configure hooks + MCP server
+inscript init             # configure retention and storage
+
+# Session tools
 inscript log [id]         # activity log
-inscript replay [id]      # context summary for handoff
+inscript replay [id]      # context summary
+
+# Human tools
 inscript explore [id]     # interactive browser
 inscript viz [id]         # visual heatmap
+
+# Notes
+inscript note "text"      # save a note (optionally --ref FILE)
+inscript notes [id]       # list notes
+
+# Organization
 inscript tag <name>       # tag current work
 inscript untag            # clear tag
 inscript time [tag]       # time spent by tag
 inscript branch "why"     # start a scoped detour
 inscript resume           # end detour, return to trunk
 inscript branches         # list branches
-inscript overlap          # file collisions across sessions
+
+# Export & maintenance
 inscript export <id>      # export session as markdown
+inscript chat-export <id> # full conversation export with responses
+inscript permissions [id] # generate permission profile from usage
+inscript overlap          # file collisions across sessions
 inscript cleanup          # enforce retention policy
-inscript init             # configure retention and storage
 ```
 
 ## How it works
 
 Four Claude Code hooks write to `~/.inscript/`:
 
-- **SessionStart** — creates session, finalizes previous session, injects handoff context
-- **UserPromptSubmit** — records prompts with tags and branch IDs
-- **PostToolUse** — records file touches, diffs, project context, and git commits
-- **Stop** — writes running summary snapshot
-
-An MCP server (`inscript-mcp`) wraps the session data as callable tools. Agents see `replay`, `log`, `sessions`, and `status` in their tool list and can call them when they need context.
-
-## Data stored
+- **SessionStart** — creates session directory, finalizes previous session, injects handoff context
+- **UserPromptSubmit** — records user prompts with timestamps
+- **PostToolUse** — records file touches, diffs, detects git commits
+- **Stop** — writes summary snapshot with token usage
 
 ```
 ~/.inscript/
+  config.toml                # retention policy, storage settings
+  active_session             # current session ID
+  active_sessions/           # per-process session tracking
   sessions/
     <session-id>/
-      meta.json          # start time, project, status
-      prompts.jsonl      # every user prompt
-      touches.jsonl      # every file read/edit/write
-      diffs.jsonl        # raw changes (configurable)
-      summary.json       # stats, token usage
-  config.toml            # retention policy
+      meta.json              # start time, project, status, transcript path
+      prompts.jsonl          # every user prompt
+      touches.jsonl          # every file read/edit/write
+      diffs.jsonl            # raw edit diffs (configurable)
+      summary.json           # stats, token usage, duration
+      commits.jsonl          # git commits linked to prompts
+      notes.jsonl            # user notes
+      branches.jsonl         # detour tracking
 ```
+
+All data is plain JSON/JSONL. Any tool can read it.
 
 ## Python API
 
 ```python
 from inscript_pkg import active_project, active_session, list_sessions
-from inscript_pkg import generate_replay, generate_log
+from inscript_pkg.replay import generate_replay, generate_log
 
 project = active_project()      # Path or None
 session = active_session()      # session ID or None
 sessions = list_sessions()      # [{session_id, start_time, project, status}, ...]
-replay = generate_replay(sid)   # compact session summary as string
-log = generate_log(sid)         # activity log as string
+replay = generate_replay(sid)   # compact session summary
+log = generate_log(sid)         # activity log
 ```
 
 ## License
