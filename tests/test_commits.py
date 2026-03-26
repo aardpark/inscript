@@ -119,11 +119,11 @@ class TestHandleGitCommit:
 
         self._patches = [
             patch.object(inscript_pkg.hook, "SESSIONS_DIR", self.sessions_dir),
-            patch.object(inscript_pkg.hook, "ACTIVE_SESSION_FILE", self.active_file),
             patch.object(inscript_pkg.hook, "ACTIVE_PROJECT_FILE", self.inscript_dir / "active_project"),
-            # active_session() reads from inscript_pkg.ACTIVE_SESSION_FILE
             patch.object(inscript_pkg, "ACTIVE_SESSION_FILE", self.active_file),
             patch.object(inscript_pkg, "SESSIONS_DIR", self.sessions_dir),
+            # active_session_for_hook reads per-PID files, patch to return our session
+            patch.object(inscript_pkg.hook, "active_session_for_hook", return_value=self.sid),
         ]
         for p in self._patches:
             p.start()
